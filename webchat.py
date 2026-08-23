@@ -32,6 +32,30 @@ def main(question):
     def js(expr):
         return cmd("Runtime.evaluate", {"expression": expr, "returnByValue": True}).get('result', {}).get('value')
 
+    # 0. Открываем НОВУЮ сессию DeepSeek (клик "New chat"), чтобы исключить путаницу
+    #    со старыми накопленными ответами в DOM. DeepSeek помнит прошлый диалог
+    #    и может вернуть ответ на старую тему, если не начать чистый чат.
+    def start_new_chat():
+        ok = js("""
+(() => {
+    const els = Array.from(document.querySelectorAll('*')).filter(e =>
+        e.children.length === 0 && /^New chat$/i.test((e.textContent || '').trim()));
+    if (!els.length) return false;
+    let el = els[0];
+    for (let i = 0; i < 4 && el; i++) {
+        if (el.tagName === 'BUTTON' || el.getAttribute('role') === 'button' || el.onclick) break;
+        el = el.parentElement;
+    }
+    el.click();
+    return true;
+})()
+""")
+        return ok
+    try:
+        start_new_chat()
+        time.sleep(2)  # дать новой сессии прогрузиться
+    except Exception:
+        pass  # если клик не удался — работаем в текущей сессии
     # 1. Фокус на поле ввода
     js("document.querySelector('textarea')?.focus(); true")
     time.sleep(1)
