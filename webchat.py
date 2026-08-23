@@ -35,8 +35,20 @@ def main(question):
     # 1. Фокус на поле ввода
     js("document.querySelector('textarea')?.focus(); true")
     time.sleep(1)
-    # 2. Считаем текущее число ответов ассистента
-    before = js("document.querySelectorAll('.ds-assistant-message-main-content').length") or 0
+    # 2. Снимок текущего состояния (text-content последнего ответа + число блоков).
+    #    НЕ полагаемся на счётчик блоков: DeepSeek иногда дописывает в существующий элемент.
+    def snapshot():
+        s = js("""
+(() => {
+    const n = document.querySelectorAll('.ds-assistant-message-main-content');
+    if (!n.length) return {count: 0, text: ''};
+    const last = n[n.length-1];
+    // innerText может отдавать скрытые/дублирующиеся куски; используем чистый textContent
+    return {count: n.length, text: (last.textContent || '').trim()};
+})()
+""") or {}
+        return s.get('count', 0), s.get('text', '') or ''
+    before_count, before_text = snapshot()
     # 3. Вставляем текст реальными событиями
     cmd("Input.insertText", {"text": question})
     time.sleep(0.5)
@@ -45,14 +57,32 @@ def main(question):
                                     "windowsVirtualKeyCode": 13, "nativeVirtualKeyCode": 13})
     cmd("Input.dispatchKeyEvent", {"type": "keyUp", "key": "Enter", "code": "Enter",
                                     "windowsVirtualKeyCode": 13, "nativeVirtualKeyCode": 13})
-    # 5. Ждём ответ (до 180 сек)
+    # 5. Ждём завершения ответа. Сигнал "ответ появился" = изменился text-content
+    #    последнего элемента (или добавился новый блок). "Ответ готов" = текст стабилен.
     deadline = time.time() + 180
+    saw_new = False     # видели ли изменение относительно снапшота
+    stable_since = None
+    last_text = before_text
     while time.time() < deadline:
-        time.sleep(4)
-        now = js("document.querySelectorAll('.ds-assistant-message-main-content').length") or 0
-        if now > before:
-            break
-    time.sleep(6)  # дать достримиться
+        time.sleep(2)
+        cur_count, cur_text = snapshot()
+        # изменилось относительно baseline?
+        changed = (cur_count != before_count) or (cur_text != before_text and (before_text == '' or not cur_text.startswith(before_text)))
+        if changed and not saw_new:
+            saw_new = True
+            last_text = cur_text
+            stable_since = None
+        elif saw_new:
+            if cur_text != last_text:
+                # текст растёт (стриминг идёт)
+                last_text = cur_text
+                stable_since = None
+            else:
+                if stable_since is None:
+                    stable_since = time.time()
+                elif time.time() - stable_since >= 4:
+                    # стабилен 4 сек — ответ готов
+                    break
     # 6. Извлекаем последний ответ
     ans = js("""
 (() => {
