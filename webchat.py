@@ -35,10 +35,7 @@ def main(question):
     # 1. Фокус на поле ввода
     js("document.querySelector('textarea')?.focus(); true")
     time.sleep(1)
-    # 2. Снимок текущего состояния. ВАЖНО: считаем только НАСТОЯЩИЕ ответы,
-    #    исключая blocks-рассуждения DeepSeek (класс ds-think-content),
-    #    которые рендерятся в тот же контейнер и могут оказаться после ответа.
-    #    Ниже "real answers" = .ds-assistant-message-main-content без предка ds-think.
+    # 2. функция снапшота: последний НАСТОЯЩИЙ ответ (без ds-think) с его count/text
     def snapshot():
         s = js("""
 (() => {
@@ -59,10 +56,10 @@ def main(question):
                                     "windowsVirtualKeyCode": 13, "nativeVirtualKeyCode": 13})
     cmd("Input.dispatchKeyEvent", {"type": "keyUp", "key": "Enter", "code": "Enter",
                                     "windowsVirtualKeyCode": 13, "nativeVirtualKeyCode": 13})
-    # 5. Ждём завершения ответа. Новый ответ появился, когда:
-    #    - увеличилось ЧИСЛО настоящих ответов (новый блок), либo
-    #    - изменился текст последнего настоящего ответа (стриминг/дописывание).
-    #    "Ответ готов" = текст последнего настоящего стабилен ~4 сек.
+    # 5. Ждём появления НОВОГО настоящего ответа и его завершения.
+    #    «Новый» = счётчик увеличился ИЛИ текст последнего настоящего изменился и не
+    #    является подстрокой до-отправленного (чтобы не схватить старый ответ,
+    #    который может торчать в вкладке и совпадать по счёту — DeepSeek замещает DOM).
     deadline = time.time() + 180
     saw_new = False
     stable_since = None
@@ -70,7 +67,11 @@ def main(question):
     while time.time() < deadline:
         time.sleep(2)
         cur_count, cur_text = snapshot()
-        changed = (cur_count != before_count) or (cur_text != before_text and (before_text == '' or not cur_text.startswith(before_text)))
+        # текст "новый" если:
+        #  - счётчик вырос, либo
+        #  - текст изменился и не является продолжением до-отправленного
+        text_changed = (cur_text != before_text) and not (before_text and cur_text.startswith(before_text))
+        changed = (cur_count != before_count) or text_changed
         if changed and not saw_new:
             saw_new = True
             last_text = cur_text

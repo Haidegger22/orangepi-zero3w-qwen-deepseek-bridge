@@ -1,21 +1,22 @@
 #!/usr/bin/env python3
-"""qwen2deepseek.py — мост: локальная qwen (Ollama) сама решает, когда спросить DeepSeek.
+"""qwen2deepseek.py — мост: локальная qwen (Ollama) маршрутизирует в DeepSeek.
 
-Цикл:
-  юзер → qwen (локальная) → либо прямой ответ, либо маркер "DEEPSEEK: <вопрос>"
-  если маркер → скрипт отправляет <вопрос> в веб DeepSeek (webchat.py) и возвращает ответ.
+Архитектура (по рекомендации Джарвиса, v0.5):
+  - qwen = БИНАРНЫЙ РОУТЕР. Отвечает только {"route":"self"} или {"route":"deepseek"},
+    temperature=0, format=json. НЕ формулирует и НЕ пересказывает вопрос.
+  - Текст запроса в DeepSeek = СЫРАЯ реплика пользователя, очищенная регэкспом
+    от командных префиксов ("спроси у deepseek" и т.п.) — не моделью.
+  - Так исключается искажение контекста ("завтра"→"сегодня") и пересказ от третьего лица.
 
 Запуск:
   python3 qwen2deepseek.py            # интерактивный цикл
   python3 qwen2deepseek.py "вопрос"   # разовый запрос
-
-Зависимости: requests, websocket-client (уже есть в ~/webchat.py окружении).
 """
 import json
 import os
 import re
-import sys
 import subprocess
+import sys
 import time
 import urllib.request
 
@@ -24,53 +25,48 @@ DEFAULT_MODEL = "qwen2.5:3b"
 WEBCAT = os.environ.get("WEBCAT", os.path.join(os.path.dirname(os.path.abspath(__file__)), "webchat.py"))
 MODEL = os.environ.get("QWEN_MODEL", DEFAULT_MODEL)
 
-SYSTEM_PROMPT = """Ты — автономный посредник между пользователем и внешней нейросетью DeepSeek.
-Правила СТРОГИЕ:
-1. Если запрос можно закрыть твоими знаниями (без поиска в интернете) — ответь сам, обычным текстом.
-2. Если нужно спросить DeepSeek (пользователь сказал «спроси у deepseek», или запрос про
-   актуальное/свежее/точные цифры), ты ОБЯЗАН ответить ровно одной строкой, начинающейся с токена:
-   DEEPSEEK: <вопрос, который надо задать>
-   Никакого текста вокруг токена DEEPSEEK. Это очень важно: строка должна НАЧИНАТЬСЯ строго с "DEEPSEEK:".
-   Токен пиши ЗАГЛАВНЫМИ латинскими буквами, ничего не добавляя до него.
-3. <вопрос> — уточни то, что именно спросить, расписав полный смысл, особенно если реплика короткая
-   (например «а дыня?» → «какого цвета дыня?»). Опирайся на историю диалога, чтобы понять контекст.
-Никогда НЕ придумывай ссылку/токен вида ARBER, DEEPS, DS: и т.п. — только ровно DEEPSEEK:
-Никогда не выдумывай факты как достоверные, если не уверен."""
+# qwen = чистый роутер: только JSON-флаг, БЕЗ пересказа вопроса
+ROUTER_PROMPT = """Ты — маршрутизатор. Реши, кто ответит пользователю.
+Ответь СТРОГО одним JSON-объектом, без пояснений и без пересказа вопроса:
+{"route":"self"} или {"route":"deepseek"}
+"deepseek" — вопрос фактологический / про внешний мир / свежие данные / требует
+знаний, поиска или рассуждений, ИЛИ пользователь явно просит «спроси у deepseek».
+"self" — простая команда, приветствие, локальная мелочь, личный диалог,
+либо пользователь явно просит ответить тебя.
+Выведи ТОЛЬКО JSON. Ничего больше."""
+
+# Регэксп-префиксы для очистки сырой реплики пользователя перед отправкой в DeepSeek.
+# Важно: НЕ модель формулирует вопрос — только эти шаблоны вырезают вводные слова.
+CMD_PREFIX_PATTERNS = [
+    r"^\s*спроси\s+у\s+deepseek[\s,::]*",
+    r"^\s*спроси\s+deepseek[\s,::]*",
+    r"^\s*спроси\s+у\s+джарвиса[\s,::]*",
+    r"^\s*deepseek[\s,::]*",
+    r"^\s*передай\s+джарвису[\s,::]*",
+    r"^\s*посмотри\s+в\s+интернет[е]?[\s,::]*",
+    r"^\s*найди[\s,::]*",
+    r"^\s*(спроси|спрашивай)\s+в\s+deepseek[\s,::]*",
+]
 
 
-# История диалога (готовится в route, подаётся в ask_qwen).
-# Нужна, чтобы qwen понимала короткие вопросы в контексте
-# (например «а дыня?» после «какого цвета арбуз?»).
+def strip_cmd_prefix(raw: str) -> str:
+    """Очистить реплику пользователя от вводных префиксов (регэксп, НЕ модель)."""
+    t = raw.strip()
+    for pat in CMD_PREFIX_PATTERNS:
+        t = re.sub(pat, "", t, count=1, flags=re.IGNORECASE).strip()
+    return t
+
+
+def _history_context() -> list:
+    """Вернуть историю последних пар. Обрезаем до разумного размера."""
+    return list(_history)
+
+
 _history: list = []
-MAX_HISTORY_PAIRS = 4  # сколько последних (user, assistant) пар держать максимум
-
-
-def _looks_unsure(text: str) -> bool:
-    """Признаки, что qwen не знает ответа сама и стоит спросить DeepSeek."""
-    t = text.lower()
-    unsure = [
-        "не знаю", "не могу", "не уверен", "не уверена", "уточните", "уточнить",
-        "недостаточно", "нет информации", "не имею", "затрудняюсь",
-        "я не могу дать", "нет доступа", "недоступн", "попробуйте", "не понимаю",
-        "пожалуйста, уточните", "не хватает", "не в курсе", "не подскажу",
-    ]
-    return any(u in t for u in unsure)
-
-
-def _extract_marker(reply: str):
-    """Вытащить текст ИЗ маркера вида 'СЛОВО: вопрос' (толерaнтно к регистру и мусорным токенам).
-
-    Ловит DEEPSEEK, ARBUZ, ARBER, DS, И т.п. — любой одиночный токен, за которым ': '.
-    Возвращает вопрос, либо None если похожи на маркер нет.
-    """
-    m = re.search(r"^\s*[A-Za-zА-Яа-яЁё_ -]{2,25}:\s*(.+)$", reply.strip(), flags=re.MULTILINE | re.DOTALL)
-    if m:
-        return m.group(1).strip().strip('"').strip()
-    return None
+MAX_HISTORY_PAIRS = 6  # сколько последних (user, assistant) пар держать максимум
 
 
 def _trim_history() -> None:
-    """Ограничить историю последними MAX_HISTORY_PAIRS парами user/assistant."""
     if len(_history) > MAX_HISTORY_PAIRS * 2:
         del _history[:len(_history) - MAX_HISTORY_PAIRS * 2]
 
@@ -79,12 +75,44 @@ def _reset_history() -> None:
     _history.clear()
 
 
-def ask_qwen(user_text: str, history=None) -> str:
-    """Отправить реплику в локальную qwen, вернуть текст ответа."""
-    messages = [{"role": "system", "content": SYSTEM_PROMPT}]
-    # подкладываем накопленную историю, если есть
-    if history is None:
-        history = _history
+def ask_qwen_router(user_text: str, history=None) -> str:
+    """Спросить qwen-роутера. Возвращает строку JSON вида {"route":"self"} или {"route":"deepseek"}.
+    При ошибке/не-парсинге возвращает {"route":"self"} (безопасный дефолт)."""
+    messages = [{"role": "system", "content": ROUTER_PROMPT}]
+    if history:
+        messages.extend(history)
+    messages.append({"role": "user", "content": user_text})
+    body = {
+        "model": MODEL,
+        "stream": False,
+        "format": "json",          # строгий JSON-вывод
+        "options": {"num_predict": 60, "temperature": 0},
+        "messages": messages,
+    }
+    req = urllib.request.Request(
+        OLLAMA,
+        data=json.dumps(body).encode(),
+        headers={"Content-Type": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=180) as resp:
+            data = json.load(resp)
+        reply = (data.get("message", {}) or {}).get("content", "").strip()
+        # извлекаем только поле "route" (не доверяем всему ответу)
+        m = re.search(r'"route"\s*:\s*"([a-zA-Z]+)"', reply)
+        if m:
+            return m.group(1).strip().lower()
+        return "self"  # нет route — безопасный дефолт
+    except Exception as exc:
+        # не падаем — дефолт self, и залогируем
+        return "self"
+
+
+def ask_qwen_answer(user_text: str, history=None) -> str:
+    """Отправить реплику в локальную qwen для ПРЯМОГО ответа (route=self)."""
+    messages = [
+        {"role": "system", "content": "Ты — полезный ассистент. Отвечай по существу."},
+    ]
     if history:
         messages.extend(history)
     messages.append({"role": "user", "content": user_text})
@@ -125,32 +153,35 @@ def ask_deepseek(question: str) -> str:
 
 
 def route(user_text: str, keep_history: bool = True) -> str:
-    """Спросить qwen и решить: ответить самой или отправить в DeepSeek."""
-    reply = ask_qwen(user_text, _history if keep_history else None)
-    q = _extract_marker(reply)
-    if not q and _looks_unsure(reply):
-        # qwen прямо говорит, что не знает → используем её реплику как запрос к DeepSeek
-        q = reply
-    if q:
-        print(f"→ qwen маршрутизирует в DeepSeek: «{q}»", file=sys.stderr)
-        deep_answer = ask_deepseek(q)
+    """qwen решает (роутер), а в DeepSeek уходит сырая реплика пользователя."""
+    route_decision = ask_qwen_router(user_text, _history if keep_history else None)
+
+    if route_decision == "deepseek":
+        # текст запроса — сырая реплика, очищенная от префиксов (НЕ модель пересказывает)
+        query = strip_cmd_prefix(user_text) or user_text
+        print(f"→ маршрут: DeepSeek; вопрос: «{query}»", file=sys.stderr)
+        deep_answer = ask_deepseek(query)
         final = f"[из DeepSeek]\n{deep_answer}"
         if keep_history:
             _history.append({"role": "user", "content": user_text})
             _history.append({"role": "assistant", "content": f"Ответ (из DeepSeek): {deep_answer}"})
             _trim_history()
         return final
+
+    # route=self — qwen отвечает сама
+    print("→ маршрут: self (qwen)", file=sys.stderr)
+    answer = ask_qwen_answer(user_text, _history if keep_history else None)
     if keep_history:
         _history.append({"role": "user", "content": user_text})
-        _history.append({"role": "assistant", "content": reply})
+        _history.append({"role": "assistant", "content": answer})
         _trim_history()
-    return reply
+    return answer
 
 
 def main():
     if len(sys.argv) > 1:
         q = " ".join(sys.argv[1:])
-        _reset_history()  # разовый вызов — без накопленного контекста
+        _reset_history()
         print(route(q, keep_history=False))
         return
 
@@ -169,7 +200,7 @@ def main():
             break
         t0 = time.time()
         try:
-            print(route(u))  # keep_history=True по умолчанию — контекст диалога
+            print(route(u))
         except Exception as exc:
             print(f"Ошибка: {exc}")
         print(f"[{(time.time()-t0):.1f} c]")
