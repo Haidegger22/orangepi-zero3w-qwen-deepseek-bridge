@@ -35,16 +35,18 @@ def main(question):
     # 1. Фокус на поле ввода
     js("document.querySelector('textarea')?.focus(); true")
     time.sleep(1)
-    # 2. Снимок текущего состояния (text-content последнего ответа + число блоков).
-    #    НЕ полагаемся на счётчик блоков: DeepSeek иногда дописывает в существующий элемент.
+    # 2. Снимок текущего состояния. ВАЖНО: считаем только НАСТОЯЩИЕ ответы,
+    #    исключая blocks-рассуждения DeepSeek (класс ds-think-content),
+    #    которые рендерятся в тот же контейнер и могут оказаться после ответа.
+    #    Ниже "real answers" = .ds-assistant-message-main-content без предка ds-think.
     def snapshot():
         s = js("""
 (() => {
-    const n = document.querySelectorAll('.ds-assistant-message-main-content');
-    if (!n.length) return {count: 0, text: ''};
-    const last = n[n.length-1];
-    // innerText может отдавать скрытые/дублирующиеся куски; используем чистый textContent
-    return {count: n.length, text: (last.textContent || '').trim()};
+    const nodes = Array.from(document.querySelectorAll('.ds-assistant-message-main-content'))
+                      .filter(el => !el.closest('[class*="ds-think"]'));
+    if (!nodes.length) return {count: 0, text: ''};
+    const last = nodes[nodes.length-1];
+    return {count: nodes.length, text: (last.textContent || '').trim()};
 })()
 """) or {}
         return s.get('count', 0), s.get('text', '') or ''
@@ -57,16 +59,17 @@ def main(question):
                                     "windowsVirtualKeyCode": 13, "nativeVirtualKeyCode": 13})
     cmd("Input.dispatchKeyEvent", {"type": "keyUp", "key": "Enter", "code": "Enter",
                                     "windowsVirtualKeyCode": 13, "nativeVirtualKeyCode": 13})
-    # 5. Ждём завершения ответа. Сигнал "ответ появился" = изменился text-content
-    #    последнего элемента (или добавился новый блок). "Ответ готов" = текст стабилен.
+    # 5. Ждём завершения ответа. Новый ответ появился, когда:
+    #    - увеличилось ЧИСЛО настоящих ответов (новый блок), либo
+    #    - изменился текст последнего настоящего ответа (стриминг/дописывание).
+    #    "Ответ готов" = текст последнего настоящего стабилен ~4 сек.
     deadline = time.time() + 180
-    saw_new = False     # видели ли изменение относительно снапшота
+    saw_new = False
     stable_since = None
     last_text = before_text
     while time.time() < deadline:
         time.sleep(2)
         cur_count, cur_text = snapshot()
-        # изменилось относительно baseline?
         changed = (cur_count != before_count) or (cur_text != before_text and (before_text == '' or not cur_text.startswith(before_text)))
         if changed and not saw_new:
             saw_new = True
@@ -74,19 +77,18 @@ def main(question):
             stable_since = None
         elif saw_new:
             if cur_text != last_text:
-                # текст растёт (стриминг идёт)
                 last_text = cur_text
                 stable_since = None
             else:
                 if stable_since is None:
                     stable_since = time.time()
                 elif time.time() - stable_since >= 4:
-                    # стабилен 4 сек — ответ готов
                     break
-    # 6. Извлекаем последний ответ
+    # 6. Извлекаем последний НАСТОЯЩИЙ ответ (без рассуждений ds-think)
     ans = js("""
 (() => {
-    const nodes = document.querySelectorAll('.ds-assistant-message-main-content');
+    const nodes = Array.from(document.querySelectorAll('.ds-assistant-message-main-content'))
+                      .filter(el => !el.closest('[class*="ds-think"]'));
     if (!nodes.length) return null;
     return nodes[nodes.length - 1].innerText;
 })()
