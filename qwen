@@ -1,0 +1,71 @@
+#!/usr/bin/env bash
+# qwen — удобный запуск моста qwen ↔ DeepSeek.
+# Использование:
+#   qwen                    — интерактивный режим
+#   qwen "вопрос"           — разовый вопрос
+#
+# Автоматически поднимает Chromium с CDP, если он не запущен.
+# Параметры можно переопределить переменными окружения:
+#   QWEN_REPO_DIR, CHROMIUM_CDP_PROFILE, CDP_PORT, QWEN_MODEL, WEBCAT
+
+set -u
+
+# Каталог репозитория (по умолчанию — там, где лежит этот скрипт)
+_REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_DIR="${QWEN_REPO_DIR:-$_REPO}"
+
+QBRIDGE="${QWEN_BRIDGE:-$REPO_DIR/qwen2deepseek.py}"
+PYTHON="${PYTHON:-python3}"
+
+CDP_PORT="${CDP_PORT:-9222}"
+USER_DATA="${CHROMIUM_CDP_PROFILE:-$HOME/.config/chromium}"
+
+# Вкладки, которые открываются вместе с DeepSeek (через CDP). Настраиваемо.
+DEFAULT_TABS=(
+  https://chat.deepseek.com
+  http://127.0.0.1:9119/chat
+  http://127.0.0.1:18789
+  http://127.0.0.1:9092/transmission/web/
+)
+if [ -n "${QWEN_EXTRA_TABS:-}" ]; then
+  # пользователь задал доп. вкладки — добавляем к дефолтным
+  OLDIFS="$IFS"; IFS=' '; read -r -a EXTRA <<< "$QWEN_EXTRA_TABS"; IFS="$OLDIFS"
+  DEFAULT_TABS+=("${EXTRA[@]}")
+fi
+
+# Убедиться, что CDP-порт слушает; если нет — запустить Chromium.
+ensure_cdp() {
+  if curl -s --max-time 2 "http://127.0.0.1:${CDP_PORT}/json/version" >/dev/null 2>&1; then
+    return 0
+  fi
+  echo "→ CDP-порт ${CDP_PORT} не активен, поднимаю Chromium…"
+  local display="${DISPLAY:-:0}"
+  DISPLAY="$display" nohup chromium \
+    --user-data-dir="$USER_DATA" \
+    --remote-debugging-port="$CDP_PORT" \
+    --remote-allow-origins='*' \
+    --no-first-run --no-default-browser-check \
+    --window-size=1280,800 \
+    "${DEFAULT_TABS[@]}" \
+    >/dev/null 2>&1 &
+  # Ждём CDP (до ~20 с)
+  for _ in $(seq 1 20); do
+    sleep 1
+    curl -s --max-time 2 "http://127.0.0.1:${CDP_PORT}/json/version" >/dev/null 2>&1 && return 0
+  done
+  echo "⚠ не удалось поднять Chromium/CDP" >&2
+  return 1
+}
+
+if ! [ -f "$QBRIDGE" ]; then
+  echo "Нет $QBRIDGE" >&2
+  exit 1
+fi
+
+ensure_cdp || exit 1
+
+# Проброс переменных, чтобы мост их видел
+export QWEN_MODEL="${QWEN_MODEL:-qwen2.5:3b}"
+if [ -n "${WEBCAT:-}" ]; then export WEBCAT; fi
+
+exec "$PYTHON" "$QBRIDGE" "$@"
