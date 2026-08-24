@@ -169,7 +169,9 @@ def ask_qwen_router(user_text: str, history=None) -> str:
 
 
 def ask_qwen_answer(user_text: str, history=None) -> str:
-    """Отправить реплику в локальную qwen для ПРЯМОГО ответа (route=self)."""
+    """Отправить реплику в локальную qwen для ПРЯМОГО ответа (route=self).
+    stream=True — генерация идёт по токенам, печатается в терминал как в `ollama run`.
+    Возвращает полный текст (для сохранения в историю)."""
     messages = [
         {"role": "system", "content": "Ты — полезный ассистент. Отвечай по существу."},
     ]
@@ -178,7 +180,7 @@ def ask_qwen_answer(user_text: str, history=None) -> str:
     messages.append({"role": "user", "content": user_text})
     body = {
         "model": MODEL,
-        "stream": False,
+        "stream": True,          # ← стримим ответ
         "options": {"num_predict": 300},
         "messages": messages,
     }
@@ -187,10 +189,32 @@ def ask_qwen_answer(user_text: str, history=None) -> str:
         data=json.dumps(body).encode(),
         headers={"Content-Type": "application/json"},
     )
+    full = ""
     try:
-        with urllib.request.urlopen(req, timeout=180) as resp:
-            data = json.load(resp)
-        return (data.get("message", {}) or {}).get("content", "").strip()
+        # Стрим Ollama = NDJSON: каждая строка — это JSON без префикса "data:".
+        with urllib.request.urlopen(req, timeout=300) as resp:
+            for raw_line in resp:
+                line = raw_line.decode("utf-8", errors="replace").strip()
+                if not line:
+                    continue
+                # если где-то есть префикс "data:" (другие клиенты), срежем жа
+                if line.startswith("data:"):
+                    line = line[5:].strip()
+                if line in ("[DONE]", ""):
+                    break
+                try:
+                    chunk = json.loads(line)
+                    msg = chunk.get("message") or {}
+                    piece = msg.get("content", "")
+                    if piece:
+                        full += piece
+                        print(piece, end="", flush=True)  # живой стримминг
+                    if msg.get("done"):
+                        break
+                except json.JSONDecodeError:
+                    continue
+        print()  # перевод строки после ответа
+        return full.strip()
     except Exception as exc:
         return f"ОШИБКА запроса к qwen: {exc}"
 
