@@ -2,9 +2,37 @@
 """webchat.py — отправка вопроса в DeepSeek через CDP (вкладка chat.deepseek.com в Chromium).
 Использование: python3 webchat.py "вопрос"
 """
-import json, sys, time, urllib.request, websocket
+import json, re, sys, time, urllib.request, websocket
 
 CDP = "http://127.0.0.1:9222"
+
+
+def _superscript_digit(d):
+    """Цифра → юникод-верхний индекс (поддерживает многозначные номера, напр. '12'→'¹²')."""
+    return "".join(c.translate(str.maketrans("0123456789", "⁰¹²³⁴⁵⁶⁷⁸⁹")) for c in d)
+
+
+def _normalize_footnotes(text):
+    """Превратить артефакты markdown-сносок DeepSeek ('-3', '-\\n-\\n3\\n.')
+    в верхние индексы сразу после слова: 'Текст³'. Берет ВСЕ цифры многоразрядных номеров."""
+    t = text or ""
+    # составные '-\n-\n<d>\n' и '-\n-<d>\n'
+    t = re.sub(r'-\s*\n\s*-\s*(\d+)\s*\n', lambda m: _superscript_digit(m.group(1)), t)
+    # '-<d>\n' (сноска в конце строки)
+    t = re.sub(r'-\s*(\d+)\s*\n', lambda m: _superscript_digit(m.group(1)), t)
+    # остаточные '-\s*-\s*(\d+)' 
+    t = re.sub(r'-\s*-\s*(\d+)', lambda m: _superscript_digit(m.group(1)), t)
+    # последний шаг: '-(\d+)' ТОЛЬКО если после числа идёт точка/конец/перенос/запятая/')'
+    # (чтобы НЕ трогать минус перед числом, напр. '-5 градусов')
+    t = re.sub(r'-\s*(\d+)(?=[.,;:)\]]|\s*$|\s*\n)', lambda m: _superscript_digit(m.group(1)), t)
+    # убрать лишние пустые строки и висячие '-'
+    t = re.sub(r'\n{3,}', '\n\n', t)
+    # висячий дефис перед переносом строки без цифры (артефакт сноски) → просто перенос
+    t = re.sub(r'-\s*\n(?!\d)', '\n', t)
+    t = re.sub(r'^\s*-\s*$', '', t, flags=re.MULTILINE)
+    # точка после индекса через перенос → соединить
+    t = re.sub(r'([⁰¹²³⁴⁵⁶⁷⁸⁹])\s*\n\.\s*', r'\1.', t)
+    return t.strip()
 
 def get_deepseek_tab():
     pages = json.load(urllib.request.urlopen(CDP + "/json/list", timeout=5))
@@ -118,7 +146,7 @@ def main(question):
     return nodes[nodes.length - 1].innerText;
 })()
 """)
-    print(ans if ans else "НЕТ ОТВЕТА (проверь вкладку вручную)")
+    print(_normalize_footnotes(ans) if ans else "НЕТ ОТВЕТА (проверь вкладку вручную)")
     ws.close()
 
 if __name__ == "__main__":
