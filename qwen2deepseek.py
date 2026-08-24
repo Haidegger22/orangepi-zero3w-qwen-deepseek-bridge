@@ -101,12 +101,34 @@ def _history_context() -> list:
 
 
 _history: list = []
-MAX_HISTORY_PAIRS = 6  # сколько последних (user, assistant) пар держать максимум
+MAX_HISTORY_PAIRS = 4  # сколько последних (user, assistant) пар держать максимум
+MAX_HISTORY_CHARS = 900  # макс суммарный объём истории в символах — не дать qwen «утонуть»
+
+# Ограничить размер фрагмента ответа DeepSeek, попадающего в историю qwen.
+# Полный длинный ответ DeepSeek раздувает контекст маленькой qwen → она медленно
+# генерирует на следующем простом вопросе (замер: «спасибо» после новостей — 119 с).
+DEEPSEEK_HISTORY_PREVIEW = 200  # символов ответа DeepSeek сохранять в историю
+
+
+def _shorten_history_entry(text: str, limit: int = DEEPSEEK_HISTORY_PREVIEW) -> str:
+    """Обрезать длинный текст до limit символов + многоточие, чтобы не раздувать контекст."""
+    text = (text or "").strip()
+    if len(text) <= limit:
+        return text
+    return text[:limit].rstrip() + "…"
 
 
 def _trim_history() -> None:
+    """Урезать историю: по числу пар И по суммарному объёму символов."""
+    # 1) по количеству пар
     if len(_history) > MAX_HISTORY_PAIRS * 2:
         del _history[:len(_history) - MAX_HISTORY_PAIRS * 2]
+    # 2) по объёму — пока суммарный вес больше лимита, срезаем самые старые пары
+    while len(_history) >= 2:
+        total = sum(len(m.get("content", "")) for m in _history)
+        if total <= MAX_HISTORY_CHARS:
+            break
+        del _history[:2]
 
 
 def _reset_history() -> None:
@@ -204,7 +226,8 @@ def route(user_text: str, keep_history: bool = True) -> str:
         final = f"[из DeepSeek]\n{deep_answer}"
         if keep_history:
             _history.append({"role": "user", "content": user_text})
-            _history.append({"role": "assistant", "content": f"Ответ (из DeepSeek): {deep_answer}"})
+            # сохраняем ОБРЕЗАННЫЙ ответ DeepSeek, чтобы не раздувать контекст qwen
+            _history.append({"role": "assistant", "content": f"Ответ (из DeepSeek): {_shorten_history_entry(deep_answer)}"})
             _trim_history()
         return final
 
