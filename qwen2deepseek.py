@@ -15,6 +15,7 @@
 import json
 import os
 import re
+import sqlite3
 import subprocess
 import sys
 import time
@@ -37,6 +38,14 @@ ROUTER_PROMPT = """Ты — маршрутизатор. Реши, кто отв�
 ВСЕГДА предпочитай "self", если можешь ответить сама базовыми знаниями.
 Не отправляй в deepseek то, с чем справишься сама.
 Выведи ТОЛЬКО JSON. Ничего больше."""
+
+# Промпт для обычного self-ответа (без RAG-контекста)
+SYSTEM_ANSWER_PROMPT = "Ты — полезный ассистент. Отвечай по существу."
+
+# Промпт для self-ответа С RAG-контекстом из локальной Википедии
+RAG_SYSTEM_PROMPT = """Ты — помощник-энциклопедия. Отвечай на основе ПРЕДОСТАВЛЕННОГО контекста из Википедии.
+Если контекст не содержит ответа — честно скажи, что в базе этого нет, не выдумывай.
+Отвечай по-русски, по существу. Ссылайся на источник как [источник: <название статьи>]."""
 
 # Регэксп-префиксы для очистки сырой реплики пользователя перед отправкой в DeepSeek.
 # Важно: НЕ модель формулирует вопрос — только эти шаблоны вырезают вводные слова.
@@ -174,7 +183,7 @@ def ask_qwen_answer(user_text: str, history=None) -> str:
     stream=True — генерация идёт по токенам, печатается в терминал как в `ollama run`.
     Возвращает полный текст (для сохранения в историю)."""
     messages = [
-        {"role": "system", "content": "Ты — полезный ассистент. Отвечай по существу."},
+        {"role": "system", "content": SYSTEM_ANSWER_PROMPT},
     ]
     if history:
         messages.extend(history)
@@ -223,6 +232,128 @@ def ask_qwen_answer(user_text: str, history=None) -> str:
         return f"ОШИБКА запроса к qwen: {exc}"
 
 
+# ── Локальный RAG (Википедия) ────────────────────────────────────────────
+RAG_DB = "/home/orangepi/ragwiki/rag.db"
+RAG_TOP = 3          # сколько фрагментов подтягивать
+RAG_PREVIEW = 400    # длина фрагмента
+
+
+def _rag_terms(query):
+    """Извлечь значимые слова из запроса для FTS5-поиска (кириллица+латиница)."""
+    STOP = {"какие","какой","какая","какое","каких","в","на","по","из","о","с","у","для","что",
+            "как","сколько","это","не","и","или","дай","расскажи","да","есть","где","кто",
+            "такое","про","об","все","через","до","при","между","почему","зачем","чем","како"}
+    words = re.findall(r"[а-яёa-z]{3,}", query.lower())
+    out = []
+    for w in words:
+        if w in STOP:
+            continue
+        # грубый стемминг окончаний
+        for suf in ("ового","ового","овых","овый","овая","овое","ный","ная","ное","ции","ию",
+                    "ия","ях","ами","ев","ов","ах","ам","ом","ем","ье","ов"):
+            if w.endswith(suf) and len(w)-len(suf) >= 3:
+                w = w[:-len(suf)]
+                break
+        if w not in out:
+            out.append(w)
+    return out
+
+
+def _rag_search(query, top=RAG_TOP):
+    """Поиск фрагментов в локальной базе Википедии. Вернуть [(title, fragment)] или []."""
+    if not os.path.exists(RAG_DB):
+        return []
+    terms = _rag_terms(query)
+    if not terms:
+        return []
+    try:
+        conn = sqlite3.connect(RAG_DB)
+        match_q = " OR ".join(f'"{t}"' for t in terms)
+        rows = conn.execute(
+            "SELECT title, body FROM articles_fts WHERE articles_fts MATCH ? "
+            "ORDER BY bm25(articles_fts) LIMIT ?", (match_q, top)
+        ).fetchall()
+        conn.close()
+    except sqlite3.OperationalError:
+        return []
+    res = []
+    for title, body in rows:
+        frag = _rag_fragment(body, terms, RAG_PREVIEW)
+        res.append((title, frag))
+    return res
+
+
+def _rag_fragment(body, terms, length):
+    """Вырезать фрагмент вокруг первого вхождения значимого слова."""
+    bl = body.lower()
+    pos = -1
+    for t in terms:
+        idx = bl.find(t)
+        if idx != -1 and (pos == -1 or idx < pos):
+            pos = idx
+    if pos == -1:
+        return body[:length]
+    start = max(0, pos - length // 4)
+    return body[start:start + length]
+
+
+def ask_qwen_answer_rag(user_text: str, history=None) -> str:
+    """qwen отвечает САМА, но с RAG-контекстом из локальной Википедии (стриминг).
+    Если фрагменты найдены — подкладываем в промпт. Возвращает полный текст."""
+    results = _rag_search(user_text)
+    # строим системный/промпт
+    if results:
+        ctx = "\n".join(f"[Фрагмент {i+1}] (источник: {t})\n{f}\n" for i, (t, f) in enumerate(results))
+        system = RAG_SYSTEM_PROMPT
+        user_msg = f"Контекст из Википедии:\n{ctx}\n\nВопрос: {user_text}\n\nДай ответ, опираясь на контекст."
+        print(f"→ RAG: найдено {len(results)} фраг.", file=sys.stderr)
+    else:
+        system = SYSTEM_ANSWER_PROMPT
+        user_msg = user_text
+        print("→ RAG: база пуста/не найдено — обычный ответ.", file=sys.stderr)
+    messages = [{"role": "system", "content": system}]
+    if history:
+        messages.extend(history)
+    messages.append({"role": "user", "content": user_msg})
+    body = {
+        "model": MODEL,
+        "stream": True,
+        "options": {"num_predict": 400},
+        "messages": messages,
+    }
+    req = urllib.request.Request(OLLAMA, data=json.dumps(body).encode(),
+                                 headers={"Content-Type": "application/json"})
+    full = ""
+    try:
+        with urllib.request.urlopen(req, timeout=300) as resp:
+            for raw_line in resp:
+                line = raw_line.decode("utf-8", errors="replace").strip()
+                if not line:
+                    continue
+                if line.startswith("data:"):
+                    line = line[5:].strip()
+                if line in ("[DONE]", ""):
+                    break
+                try:
+                    chunk = json.loads(line)
+                    msg = chunk.get("message") or {}
+                    piece = msg.get("content", "")
+                    if piece:
+                        full += piece
+                        print(piece, end="", flush=True)
+                    if msg.get("done"):
+                        break
+                except json.JSONDecodeError:
+                    continue
+        print()
+        global _last_was_self_stream
+        if full.strip():
+            _last_was_self_stream = True
+        return full.strip()
+    except Exception as exc:
+        return f"ОШИБКА запроса к qwen: {exc}"
+
+
 def ask_deepseek(question: str) -> str:
     """Запустить webchat.py с вопросом, вернуть ответ DeepSeek."""
     try:
@@ -241,28 +372,27 @@ def ask_deepseek(question: str) -> str:
 
 
 def route(user_text: str, keep_history: bool = True) -> str:
-    """Определить маршрут: по явному префиксу (символы) или qwen-роутером."""
-    # 1. Жёсткие триггеры по тексту (символы/префиксы) — предсказуемо, без qwen.
+    """Маршрутизация: если запрос начинается с 'deepseek'/«спроси у deepseek» → DeepSeek,
+    иначе — self (qwen отвечает сама, с RAG-контекстом из локальной Википедии)."""
+    # 1. Явный префикс deepseek → только тогда идём в DeepSeek
     detected = detect_route_by_text(user_text)
-    route_decision = detected if detected else ask_qwen_router(user_text, _history if keep_history else None)
+    go_deepseek = detected == "deepseek"
 
-    if route_decision == "deepseek":
-        # текст запроса — сырая реплика, очищенная от префиксов (НЕ модель пересказывает)
+    if go_deepseek:
         query = strip_cmd_prefix(user_text) or user_text
         print(f"→ маршрут: DeepSeek; вопрос: «{query}»", file=sys.stderr)
         deep_answer = ask_deepseek(query)
         final = f"[из DeepSeek]\n{deep_answer}"
         if keep_history:
             _history.append({"role": "user", "content": user_text})
-            # сохраняем ОБРЕЗАННЫЙ ответ DeepSeek, чтобы не раздувать контекст qwen
             _history.append({"role": "assistant", "content": f"Ответ (из DeepSeek): {_shorten_history_entry(deep_answer)}"})
             _trim_history()
-        _last_was_self_stream = False  # deepseek не стримится — надо печатать в main
+        _last_was_self_stream = False
         return final
 
-    # route=self — qwen отвечает сама
-    print("→ маршрут: self (qwen)", file=sys.stderr)
-    answer = ask_qwen_answer(user_text, _history if keep_history else None)
+    # 2. self + RAG — qwen отвечает сама, подтягивая фрагменты из локальной Википедии
+    print("→ маршрут: self (qwen + RAG)", file=sys.stderr)
+    answer = ask_qwen_answer_rag(user_text, _history if keep_history else None)
     if keep_history:
         _history.append({"role": "user", "content": user_text})
         _history.append({"role": "assistant", "content": answer})
