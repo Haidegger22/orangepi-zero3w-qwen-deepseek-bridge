@@ -101,6 +101,7 @@ def _history_context() -> list:
 
 
 _history: list = []
+_last_was_self_stream = False  # True, если последний ответ qwen уже отстримлен (чтобы не дублировать)
 MAX_HISTORY_PAIRS = 4  # сколько последних (user, assistant) пар держать максимум
 MAX_HISTORY_CHARS = 1000  # макс суммарный объём истории в символах — баланс памяти и скорости
 
@@ -214,6 +215,9 @@ def ask_qwen_answer(user_text: str, history=None) -> str:
                 except json.JSONDecodeError:
                     continue
         print()  # перевод строки после ответа
+        global _last_was_self_stream
+        if full.strip():
+            _last_was_self_stream = True  # ответ уже напечатан стриммингом
         return full.strip()
     except Exception as exc:
         return f"ОШИБКА запроса к qwen: {exc}"
@@ -253,6 +257,7 @@ def route(user_text: str, keep_history: bool = True) -> str:
             # сохраняем ОБРЕЗАННЫЙ ответ DeepSeek, чтобы не раздувать контекст qwen
             _history.append({"role": "assistant", "content": f"Ответ (из DeepSeek): {_shorten_history_entry(deep_answer)}"})
             _trim_history()
+        _last_was_self_stream = False  # deepseek не стримится — надо печатать в main
         return final
 
     # route=self — qwen отвечает сама
@@ -266,10 +271,15 @@ def route(user_text: str, keep_history: bool = True) -> str:
 
 
 def main():
+    global _last_was_self_stream
     if len(sys.argv) > 1:
         q = " ".join(sys.argv[1:])
         _reset_history()
-        print(route(q, keep_history=False))
+        result = route(q, keep_history=False)
+        # в разовом режиме для self ответ уже отстримлен в ask_qwen_answer —
+        # печатаем только если маршрут не self (deepseek или ошибка)
+        if not _last_was_self_stream:
+            print(result)
         return
 
     _reset_history()
@@ -286,8 +296,12 @@ def main():
         if u.lower() in ("exit", "quit", "выход"):
             break
         t0 = time.time()
+        _last_was_self_stream = False
         try:
-            print(route(u))
+            result = route(u)
+            # self уже отстримлен → дубль не печатаем; deepseek → печатаем
+            if not _last_was_self_stream:
+                print(result)
         except Exception as exc:
             print(f"Ошибка: {exc}")
         print(f"[{(time.time()-t0):.1f} c]")
