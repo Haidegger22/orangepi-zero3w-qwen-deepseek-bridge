@@ -241,7 +241,7 @@ def ask_qwen_answer(user_text: str, history=None) -> str:
 # ── Локальный RAG (Википедия) ────────────────────────────────────────────
 RAG_DB = "/home/orangepi/ragwiki/rag.db"
 RAG_TOP = 3          # сколько фрагментов подтягивать
-RAG_PREVIEW = 400    # длина фрагмента
+RAG_PREVIEW = 1400   # длина фрагмента (увеличено: qwen видит больше текста и характеристики)
 
 
 def _rag_terms(query):
@@ -313,9 +313,10 @@ def _rag_fragment(body, terms, length):
         idx = bl.find(t)
         if idx != -1 and (pos == -1 or idx < pos):
             pos = idx
-    if pos == -1:
+    if pos == -1 or len(body) <= length:
         return body[:length]
-    start = max(0, pos - length // 4)
+    # сдвиг окна вперёд от термина — захватываем раздел характеристик (идёт после упоминания модели)
+    start = max(0, pos - length // 6)
     return body[start:start + length]
 
 
